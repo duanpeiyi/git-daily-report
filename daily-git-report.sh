@@ -32,6 +32,11 @@ if [ -z "$LARK_CLI" ]; then
   exit 1
 fi
 
+# lark-cli 是 node 脚本，其 shebang 走 `env node`。定时任务(launchd/任务计划)的 PATH 很干净，
+# 常找不到 nvm/npm 装的 node，导致 "env: node: No such file or directory"。
+# node 与 lark-cli 通常在同一 bin 目录，把它加进 PATH 即可。
+export PATH="$(dirname "$LARK_CLI"):$PATH"
+
 # open_id 没填就用当前登录用户自己的（发给自己）
 if [ -z "${MY_OPEN_ID:-}" ]; then
   MY_OPEN_ID="$("$LARK_CLI" auth status 2>/dev/null | sed -n 's/.*"openId": *"\(ou_[^"]*\)".*/\1/p' | head -1)"
