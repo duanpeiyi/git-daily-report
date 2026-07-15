@@ -1,0 +1,6 @@
+# 个人配置，含 open_id 等隐私，不上传
+config.sh
+
+# 运行日志
+run.log
+*.log
