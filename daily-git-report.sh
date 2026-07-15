@@ -1,10 +1,12 @@
 #!/bin/bash
-# 每天定时：汇总当天 git 提交，整理成日报，推送到飞书（默认发给自己）。
+# 汇总 git 提交，整理成日报/周报，推送到飞书（默认发给自己）。
 #
 # 用法：
-#   ./daily-git-report.sh            # 汇总今天
-#   ./daily-git-report.sh 2026-07-14 # 汇总指定日期
-#   DRY_RUN=1 ./daily-git-report.sh  # 只打印不发送
+#   ./daily-git-report.sh                 # 日报：今天
+#   ./daily-git-report.sh 2026-07-14      # 日报：指定某天
+#   ./daily-git-report.sh week            # 周报：本周（周一至今天）
+#   ./daily-git-report.sh week 2026-07-18 # 周报：包含该日期的那一周（周一至该日）
+#   DRY_RUN=1 ./daily-git-report.sh ...   # 只打印不发送
 #
 # 配置全部写在同目录的 config.sh 里（首次使用：cp config.example.sh config.sh 后填写）。
 
@@ -21,7 +23,7 @@ fi
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-# lark-cli 路径：配置里没写就自动探测（launchd 场景建议在 config.sh 写绝对路径）
+# lark-cli 路径：配置里没写就自动探测（定时任务场景建议在 config.sh 写绝对路径）
 if [ -z "${LARK_CLI:-}" ] || [ ! -x "$LARK_CLI" ]; then
   LARK_CLI="$(command -v lark-cli 2>/dev/null || true)"
 fi
@@ -40,7 +42,48 @@ if [ -z "$MY_OPEN_ID" ]; then
 fi
 
 SEND_AS="${SEND_AS:-bot}"
-DATE_STR="${1:-$(date +%Y-%m-%d)}"
+
+# ==================== 跨平台日期工具（macOS BSD date / Linux·Git Bash GNU date）====================
+date_add() {  # $1=YYYY-MM-DD  $2=天数偏移(可负)  ->  YYYY-MM-DD
+  local base="$1" off="$2"
+  if date -d "$base +0 days" +%Y-%m-%d >/dev/null 2>&1; then
+    date -d "$base $off days" +%Y-%m-%d
+  else
+    local sign="+" n="$off"
+    case "$off" in -*) sign="-"; n="${off#-}";; esac
+    date -j -v"${sign}${n}d" -f "%Y-%m-%d" "$base" +%Y-%m-%d
+  fi
+}
+weekday() {  # 1=周一 ... 7=周日
+  local base="$1"
+  if date -d "$base +0 days" +%u >/dev/null 2>&1; then
+    date -d "$base" +%u
+  else
+    date -j -f "%Y-%m-%d" "$base" +%u
+  fi
+}
+
+# ==================== 解析参数：日报 / 周报 ====================
+MODE="day"
+DATE_ARG=""
+if [ "${1:-}" = "week" ]; then
+  MODE="week"; DATE_ARG="${2:-}"
+else
+  DATE_ARG="${1:-}"
+fi
+BASE_DATE="${DATE_ARG:-$(date +%Y-%m-%d)}"
+
+if [ "$MODE" = "week" ]; then
+  U="$(weekday "$BASE_DATE")"
+  START="$(date_add "$BASE_DATE" "-$((U - 1))")"   # 回退到本周周一
+  END="$BASE_DATE"
+  TITLE="📅 ${START} ~ ${END} 本周周报"
+  EMPTY_TXT="本周没有检索到 git 提交记录。"
+else
+  START="$BASE_DATE"; END="$BASE_DATE"
+  TITLE="📅 ${BASE_DATE} 工作日报"
+  EMPTY_TXT="今天没有检索到 git 提交记录。"
+fi
 
 # 分类：commit 前缀 -> 中文标题（保持这个顺序输出）
 CAT_KEYS=(feat fix perf refactor style docs test chore other)
@@ -57,8 +100,6 @@ cat_label() {
     *)        echo "📌 其他" ;;
   esac
 }
-
-# 把 commit 前缀归一到 CAT_KEYS 里的某一类
 normalize_type() {
   case "$1" in
     feat|feature)      echo feat ;;
@@ -88,15 +129,13 @@ for repo in "${REPOS[@]}"; do
   [ -n "${AUTHOR:-}" ] && author_args=(--author="$AUTHOR")
 
   subjects="$(git -C "$repo" log --all --no-merges \
-    --since="$DATE_STR 00:00:00" --until="$DATE_STR 23:59:59" \
+    --since="$START 00:00:00" --until="$END 23:59:59" \
     "${author_args[@]}" \
     --pretty=format:'%s' 2>/dev/null)"
 
   while IFS= read -r subj; do
     [ -z "$subj" ] && continue
-    # 去掉 gitee MR 前缀，如 "!174 fix: xxx"
     subj="$(printf '%s' "$subj" | sed -E 's/^![0-9]+[[:space:]]+//')"
-    # 解析 type(scope): desc
     if printf '%s' "$subj" | grep -qE '^[a-zA-Z]+(\([^)]*\))?:'; then
       rawtype="$(printf '%s' "$subj" | sed -E 's/^([a-zA-Z]+)(\([^)]*\))?:.*/\1/' | tr '[:upper:]' '[:lower:]')"
       desc="$(printf '%s' "$subj" | sed -E 's/^[a-zA-Z]+(\([^)]*\))?:[[:space:]]*//')"
@@ -110,11 +149,11 @@ for repo in "${REPOS[@]}"; do
   done <<< "$subjects"
 done
 
-# ==================== 组装日报文本 ====================
-MSG="**📅 $DATE_STR 工作日报**"$'\n'
+# ==================== 组装文本 ====================
+MSG="**${TITLE}**"$'\n'
 
 if [ "$TOTAL" -eq 0 ]; then
-  MSG+=$'\n'"今天没有检索到 git 提交记录。"
+  MSG+=$'\n'"$EMPTY_TXT"
 else
   for key in "${CAT_KEYS[@]}"; do
     lines="$(awk -F'\t' -v k="$key" '$1==k{print $2}' "$TMP")"
