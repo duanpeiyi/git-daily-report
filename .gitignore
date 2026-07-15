@@ -4,3 +4,6 @@ config.sh
 # 运行日志
 run.log
 *.log
+
+# 调度器状态（记录当天/本周是否已发）
+.state/
