@@ -1,5 +1,5 @@
 #!/bin/bash
-# 汇总 git 提交，整理成日报/周报，推送到飞书（默认发给自己）。
+# 汇总 git 提交，整理成日报/周报（编号+标题+可选正文说明），推送到飞书（默认发给自己）。
 #
 # 用法：
 #   ./daily-git-report.sh                 # 日报：今天
@@ -23,7 +23,6 @@ fi
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-# lark-cli 路径：配置里没写就自动探测（定时任务场景建议在 config.sh 写绝对路径）
 if [ -z "${LARK_CLI:-}" ] || [ ! -x "$LARK_CLI" ]; then
   LARK_CLI="$(command -v lark-cli 2>/dev/null || true)"
 fi
@@ -37,7 +36,6 @@ fi
 # node 与 lark-cli 通常在同一 bin 目录，把它加进 PATH 即可。
 export PATH="$(dirname "$LARK_CLI"):$PATH"
 
-# open_id 没填就用当前登录用户自己的（发给自己）
 if [ -z "${MY_OPEN_ID:-}" ]; then
   MY_OPEN_ID="$("$LARK_CLI" auth status 2>/dev/null | sed -n 's/.*"openId": *"\(ou_[^"]*\)".*/\1/p' | head -1)"
 fi
@@ -48,7 +46,7 @@ fi
 
 SEND_AS="${SEND_AS:-bot}"
 
-# ==================== 跨平台日期工具（macOS BSD date / Linux·Git Bash GNU date）====================
+# ==================== 跨平台日期工具 ====================
 date_add() {  # $1=YYYY-MM-DD  $2=天数偏移(可负)  ->  YYYY-MM-DD
   local base="$1" off="$2"
   if date -d "$base +0 days" +%Y-%m-%d >/dev/null 2>&1; then
@@ -69,8 +67,7 @@ weekday() {  # 1=周一 ... 7=周日
 }
 
 # ==================== 解析参数：日报 / 周报 ====================
-MODE="day"
-DATE_ARG=""
+MODE="day"; DATE_ARG=""
 if [ "${1:-}" = "week" ]; then
   MODE="week"; DATE_ARG="${2:-}"
 else
@@ -80,7 +77,7 @@ BASE_DATE="${DATE_ARG:-$(date +%Y-%m-%d)}"
 
 if [ "$MODE" = "week" ]; then
   U="$(weekday "$BASE_DATE")"
-  START="$(date_add "$BASE_DATE" "-$((U - 1))")"   # 回退到本周周一
+  START="$(date_add "$BASE_DATE" "-$((U - 1))")"
   END="$BASE_DATE"
   TITLE="📅 ${START} ~ ${END} 本周周报"
   EMPTY_TXT="本周没有检索到 git 提交记录。"
@@ -90,86 +87,61 @@ else
   EMPTY_TXT="今天没有检索到 git 提交记录。"
 fi
 
-# 分类：commit 前缀 -> 中文标题（保持这个顺序输出）
-CAT_KEYS=(feat fix perf refactor style docs test chore other)
-cat_label() {
-  case "$1" in
-    feat)     echo "✨ 新功能" ;;
-    fix)      echo "🐛 问题修复" ;;
-    perf)     echo "⚡ 性能优化" ;;
-    refactor) echo "♻️ 重构" ;;
-    style)    echo "💄 样式调整" ;;
-    docs)     echo "📝 文档" ;;
-    test)     echo "✅ 测试" ;;
-    chore)    echo "🔧 杂项/构建" ;;
-    *)        echo "📌 其他" ;;
-  esac
-}
-normalize_type() {
-  case "$1" in
-    feat|feature)      echo feat ;;
-    fix|bugfix|hotfix) echo fix ;;
-    perf)              echo perf ;;
-    refactor)          echo refactor ;;
-    style)             echo style ;;
-    docs|doc)          echo docs ;;
-    test|tests)        echo test ;;
-    chore|build|ci)    echo chore ;;
-    *)                 echo other ;;
-  esac
-}
+# ==================== 采集提交（标题 + 正文），按标题去重 ====================
+SEEN="$(mktemp)"; trap 'rm -f "$SEEN"' EXIT
+TITLES=(); BODIES=()
 
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
-
-TOTAL=0
+clean_subject() {
+  # 去掉 gitee MR 前缀(!174 )与约定式前缀(feat:/fix(scope): 等)
+  printf '%s' "$1" \
+    | sed -E 's/^![0-9]+[[:space:]]+//' \
+    | sed -E 's/^[a-zA-Z]+(\([^)]*\))?:[[:space:]]*//'
+}
 
 for repo in "${REPOS[@]}"; do
-  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    echo "跳过（不是 git 仓库）: $repo" >&2
-    continue
-  fi
+  git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "跳过(非git仓库): $repo" >&2; continue; }
+  author_args=(); [ -n "${AUTHOR:-}" ] && author_args=(--author="$AUTHOR")
 
-  author_args=()
-  [ -n "${AUTHOR:-}" ] && author_args=(--author="$AUTHOR")
-
-  subjects="$(git -C "$repo" log --all --no-merges \
+  shas="$(git -C "$repo" log --all --no-merges \
     --since="$START 00:00:00" --until="$END 23:59:59" \
-    "${author_args[@]}" \
-    --pretty=format:'%s' 2>/dev/null)"
+    "${author_args[@]}" --pretty=format:'%H' 2>/dev/null)"
 
-  while IFS= read -r subj; do
-    [ -z "$subj" ] && continue
-    subj="$(printf '%s' "$subj" | sed -E 's/^![0-9]+[[:space:]]+//')"
-    if printf '%s' "$subj" | grep -qE '^[a-zA-Z]+(\([^)]*\))?:'; then
-      rawtype="$(printf '%s' "$subj" | sed -E 's/^([a-zA-Z]+)(\([^)]*\))?:.*/\1/' | tr '[:upper:]' '[:lower:]')"
-      desc="$(printf '%s' "$subj" | sed -E 's/^[a-zA-Z]+(\([^)]*\))?:[[:space:]]*//')"
-    else
-      rawtype="other"
-      desc="$subj"
-    fi
-    cat="$(normalize_type "$rawtype")"
-    printf '%s\t%s\n' "$cat" "$desc" >> "$TMP"
-    TOTAL=$((TOTAL + 1))
-  done <<< "$subjects"
+  while IFS= read -r sha; do
+    [ -z "$sha" ] && continue
+    subj="$(git -C "$repo" show -s --format='%s' "$sha")"
+    title="$(clean_subject "$subj")"
+    [ -z "$title" ] && continue
+    grep -qxF -- "$title" "$SEEN" && continue   # 按标题去重（含跨分支的同一改动）
+    printf '%s\n' "$title" >> "$SEEN"
+    # 正文：去掉 Co-authored-by / Signed-off-by 等 trailer 与空行
+    body="$(git -C "$repo" show -s --format='%b' "$sha" \
+      | grep -viE '^(Co-authored-by|Signed-off-by|Co-Authored-By):' \
+      | sed '/^[[:space:]]*$/d')"
+    TITLES+=("$title")
+    BODIES+=("$body")
+  done <<< "$shas"
 done
 
-# ==================== 组装文本 ====================
+TOTAL="${#TITLES[@]}"
+
+# ==================== 组装文本（编号 + 标题 + 可选正文）====================
 MSG="**${TITLE}**"$'\n'
 
 if [ "$TOTAL" -eq 0 ]; then
   MSG+=$'\n'"$EMPTY_TXT"
 else
-  for key in "${CAT_KEYS[@]}"; do
-    lines="$(awk -F'\t' -v k="$key" '$1==k{print $2}' "$TMP")"
-    [ -z "$lines" ] && continue
-    MSG+=$'\n'"**$(cat_label "$key")**"$'\n'
-    while IFS= read -r d; do
-      [ -z "$d" ] && continue
-      MSG+="- ${d}"$'\n'
-    done <<< "$(printf '%s\n' "$lines" | awk '!seen[$0]++')"
+  n=0
+  for i in "${!TITLES[@]}"; do
+    n=$((n + 1))
+    MSG+=$'\n'"**${n}. ${TITLES[$i]}**"$'\n'
+    if [ -n "${BODIES[$i]}" ]; then
+      while IFS= read -r bl; do
+        [ -z "$bl" ] && continue
+        MSG+="${bl}"$'\n'
+      done <<< "${BODIES[$i]}"
+    fi
   done
-  MSG+=$'\n'"—— 共 ${TOTAL} 条提交"
+  MSG+=$'\n'"—— 共 ${TOTAL} 项"
 fi
 
 # ==================== 发送到飞书 ====================
